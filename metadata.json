@@ -1,0 +1,5 @@
+{
+  "name": "Grounded Knowledge Chatbot",
+  "description": "Chatbot especializado em responder perguntas baseadas exclusivamente em uma base de conhecimento de documentos Markdown.",
+  "requestFramePermissions": []
+}

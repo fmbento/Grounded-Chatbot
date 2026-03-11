@@ -1,0 +1,427 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Send, Bot, User, Loader2, Trash2, FileText, Upload, X, CheckCircle2, AlertCircle, Info } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI, GenerateContentResponse, Type, FunctionDeclaration } from "@google/genai";
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: Date;
+}
+
+interface KBFile {
+  name: string;
+  content: string;
+  size: number;
+  type: string;
+  downloadUrl: string;
+}
+
+const libraryOccupancyTool: FunctionDeclaration = {
+  name: "getLibraryOccupancy",
+  parameters: {
+    type: Type.OBJECT,
+    description: "Retrieves the last count of users in one of the UA Libraries. Use for queries about load, how many people, if it's busy or quiet. NOT for opening hours.",
+    properties: {
+      biblioteca: {
+        type: Type.STRING,
+        description: "The library identifier: BibUA (Main/Campus), Mediateca, ISCA, ESAN, or ESTGA.",
+        enum: ["BibUA", "Mediateca", "ISCA", "ESAN", "ESTGA"]
+      },
+    },
+    required: ["biblioteca"],
+  },
+};
+
+export default function App() {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [kbFiles, setKbFiles] = useState<KBFile[]>([]);
+  const [isKbOpen, setIsKbOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const kbInputRef = useRef<HTMLInputElement>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  useEffect(() => {
+    const fetchKbFiles = async () => {
+      try {
+        const response = await fetch('/api/kb');
+        if (response.ok) {
+          const data = await response.json();
+          setKbFiles(data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch KB files:', err);
+      }
+    };
+    fetchKbFiles();
+  }, []);
+
+  const clearChat = () => {
+    setMessages([]);
+  };
+
+  const totalKbSize = kbFiles.reduce((acc, file) => acc + file.size, 0);
+  const totalKbContent = kbFiles.map(f => `--- FILE: ${f.name} (Type: ${f.type}, Download: ${f.downloadUrl}) ---\n${f.content}`).join('\n\n');
+
+  const executeTool = async (name: string, args: any) => {
+    if (name === "getLibraryOccupancy") {
+      const bib = args.biblioteca;
+      const url = `https://script.google.com/macros/s/AKfycbx5wRnGBHyq9JRYDXYPBlu2I1fSFDOb_zF7NVhqAQKuMnPMf4Oc6IXsW033LsdT0Kwo/exec?sheet=${bib}`;
+      try {
+        const response = await fetch(url);
+        const text = await response.text();
+        return text;
+      } catch (error: any) {
+        return `Error: ${error.message}`;
+      }
+    }
+    return "Unknown tool";
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading) return;
+
+    setError(null);
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: input,
+      timestamp: new Date(),
+    };
+
+    setMessages(prev => [...prev, userMessage]);
+    setInput('');
+    setIsLoading(true);
+
+    const assistantMessageId = (Date.now() + 1).toString();
+    setMessages(prev => [...prev, {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      timestamp: new Date(),
+    }]);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+      
+      const systemInstruction = `
+        Você é um assistente especializado e estritamente limitado à base de conhecimento fornecida abaixo, exceto quando precisar de informações em tempo real sobre a ocupação das bibliotecas.
+        
+        REGRAS CRÍTICAS:
+        1. Para perguntas sobre a ocupação das bibliotecas da UA (quantas pessoas, se está cheio/vazio), use a ferramenta 'getLibraryOccupancy'.
+        2. Para todas as outras perguntas, responda APENAS com base nos documentos fornecidos na BASE DE CONHECIMENTO.
+        3. Se a resposta não estiver na base de conhecimento e não for sobre ocupação em tempo real, diga educadamente que não possui essa informação.
+        4. NÃO use seu conhecimento geral prévio.
+        5. CITAÇÃO DE FONTE: Sempre que usar informação de um ficheiro da base de conhecimento, você DEVE extrair o valor que indica de onde essa informação foi obtida. Para ficheiros .md ou .txt, procure por '## Fonte'. Para PDFs, use o nome do ficheiro e o link de download.
+        6. FORMATO DE LINK: Escreva o link da fonte no final da sua resposta precedido pelo texto "Fonte, onde saber mais: " usando o formato Markdown: Fonte, onde saber mais: [Nome da Fonte](URL). Garanta que a URL seja clicável.
+        7. PDFS: Se a fonte for um ficheiro PDF, use o link de download fornecido no cabeçalho do ficheiro (ex: /kb-files/nome.pdf) e adicione " (PDF)" logo após o link. Exemplo: Fonte, onde saber mais: [Guia.pdf](/kb-files/Guia.pdf) (PDF).
+        
+        MAPEAMENTO DE BIBLIOTECAS para 'getLibraryOccupancy':
+        - BibUA: Biblioteca Central / Campus / UA.
+        - Mediateca: Mediateca.
+        - ISCA: ISCA, ISCA-UA ou Domingos Cravo.
+        - ESAN: ESAN ou Escola Superior Aveiro-Norte.
+        - ESTGA: ESTGA ou Escola Superior de Tecnologia e Gestão de Águeda.
+        
+        BASE DE CONHECIMENTO:
+        ${totalKbContent || "Nenhum documento carregado ainda."}
+      `;
+
+      let currentContents: any[] = [{ role: 'user', parts: [{ text: input }] }];
+      let finalResponse = "";
+
+      // Loop to handle potential function calls
+      while (true) {
+        const response = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: currentContents,
+          config: {
+            systemInstruction: systemInstruction,
+            temperature: 0.1,
+            tools: [{ functionDeclarations: [libraryOccupancyTool] }],
+          }
+        });
+
+        const candidate = response.candidates[0];
+        const parts = candidate.content.parts;
+        
+        // Check for function calls
+        const functionCalls = response.functionCalls;
+        if (functionCalls && functionCalls.length > 0) {
+          const toolResults = [];
+          for (const fc of functionCalls) {
+            const result = await executeTool(fc.name, fc.args);
+            toolResults.push({
+              functionResponse: {
+                name: fc.name,
+                response: { result }
+              }
+            });
+          }
+          
+          // Add model's turn (the function call) and the tool response to history
+          currentContents.push(candidate.content);
+          currentContents.push({ role: 'user', parts: toolResults });
+          continue; // Ask model again with tool results
+        }
+
+        // No more function calls, get the text
+        finalResponse = response.text || "";
+        break;
+      }
+
+      setMessages(prev => prev.map(msg => 
+        msg.id === assistantMessageId 
+          ? { ...msg, content: finalResponse }
+          : msg
+      ));
+
+    } catch (err: any) {
+      console.error('Chat Error:', err);
+      setMessages(prev => prev.map(msg => 
+        msg.id === assistantMessageId 
+          ? { ...msg, content: 'Erro ao processar resposta. Verifique sua conexão ou API key.' }
+          : msg
+      ));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="flex h-screen bg-[#f5f5f5] font-sans text-[#1a1a1a] overflow-hidden">
+      {/* Sidebar / Knowledge Base Panel */}
+      <motion.aside 
+        initial={false}
+        animate={{ width: isKbOpen ? 320 : 0, opacity: isKbOpen ? 1 : 0 }}
+        className="bg-white border-r border-black/5 flex flex-col shadow-xl z-20 overflow-hidden"
+      >
+        <div className="p-6 border-b border-black/5 flex justify-between items-center bg-white sticky top-0">
+          <div className="flex items-center gap-2">
+            <FileText className="text-emerald-600" size={20} />
+            <h2 className="font-semibold text-sm uppercase tracking-wider">Base de Conhecimento</h2>
+          </div>
+          <button onClick={() => setIsKbOpen(false)} className="p-1 hover:bg-gray-100 rounded-lg">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-2xl space-y-2">
+            <div className="flex items-center gap-2 text-emerald-700 font-medium text-xs">
+              <Info size={14} />
+              <span>Status da Base</span>
+            </div>
+            <div className="text-[11px] text-emerald-600 space-y-1">
+              <p>Arquivos: {kbFiles.length}</p>
+              <p>Tamanho total: {(totalKbSize / 1024).toFixed(1)} KB</p>
+              <p className="mt-2 italic opacity-70">Carregados da pasta /KB</p>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            {kbFiles.length === 0 && (
+              <p className="text-[11px] text-gray-400 text-center py-8 italic">
+                Nenhum documento encontrado na pasta /KB.
+              </p>
+            )}
+            {kbFiles.map((file, idx) => (
+              <div key={idx} className="group flex items-center justify-between p-3 bg-gray-50 rounded-xl border border-black/5 hover:border-emerald-200 transition-all">
+                <div className="flex items-center gap-2 overflow-hidden">
+                  <FileText size={14} className="text-gray-400 shrink-0" />
+                  <span className="text-xs truncate font-medium">{file.name}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </motion.aside>
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col relative">
+        {/* Header */}
+        <header className="bg-white border-b border-black/5 px-6 py-4 flex justify-between items-center shadow-sm z-10">
+          <div className="flex items-center gap-3">
+            {!isKbOpen && (
+              <button 
+                onClick={() => setIsKbOpen(true)}
+                className="p-2 hover:bg-gray-100 rounded-xl text-gray-500 transition-all relative"
+              >
+                <FileText size={20} />
+                {kbFiles.length > 0 && (
+                  <span className="absolute top-1 right-1 w-2 h-2 bg-emerald-500 rounded-full border-2 border-white"></span>
+                )}
+              </button>
+            )}
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center text-white shadow-sm">
+                <Bot size={24} />
+              </div>
+              <div>
+                <h1 className="font-semibold text-lg tracking-tight">Grounded Chatbot</h1>
+                <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-widest">Base de Conhecimento + Real-Time</p>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={clearChat}
+              className="p-2 hover:bg-gray-100 text-gray-400 hover:text-gray-600 rounded-xl transition-colors"
+              title="Limpar conversa"
+            >
+              <Trash2 size={20} />
+            </button>
+          </div>
+        </header>
+
+        {/* Chat Area */}
+        <main className="flex-1 overflow-y-auto p-6 space-y-6">
+          <div className="max-w-3xl mx-auto space-y-6">
+            {messages.length === 0 && (
+              <div className="flex flex-col items-center justify-center h-[60vh] text-center space-y-6">
+                <div className="w-24 h-24 bg-white rounded-[2.5rem] shadow-xl flex items-center justify-center text-emerald-600 mb-2 border border-black/5">
+                  <Bot size={48} />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-3xl font-light text-gray-800">Como posso ajudar?</h2>
+                  <p className="text-gray-500 max-w-md mx-auto text-sm">
+                    Carregue seus arquivos .md ou pergunte sobre a ocupação das bibliotecas da UA em tempo real.
+                  </p>
+                </div>
+                
+                <div className="flex flex-wrap justify-center gap-3">
+                  {kbFiles.length > 0 && (
+                    <div className="flex items-center gap-2 px-4 py-2 bg-emerald-50 text-emerald-700 rounded-full text-xs font-medium border border-emerald-100">
+                      <CheckCircle2 size={14} />
+                      {kbFiles.length} documentos carregados da pasta /KB
+                    </div>
+                  )}
+                  <button 
+                    onClick={() => setInput("Quantas pessoas estão na Biblioteca Central agora?")}
+                    className="flex items-center gap-2 px-6 py-3 bg-white border border-black/5 text-gray-600 rounded-2xl shadow-sm hover:bg-gray-50 transition-all"
+                  >
+                    <Info size={18} className="text-emerald-500" />
+                    Ocupação Real-Time
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <AnimatePresence initial={false}>
+              {messages.map((message) => (
+                <motion.div
+                  key={message.id}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div className={`flex gap-4 max-w-[90%] ${message.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+                    <div className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 shadow-sm ${
+                      message.role === 'user' ? 'bg-emerald-100 text-emerald-700' : 'bg-white text-gray-600 border border-black/5'
+                    }`}>
+                      {message.role === 'user' ? <User size={20} /> : <Bot size={20} />}
+                    </div>
+                    <div className={`space-y-1.5 ${message.role === 'user' ? 'items-end' : 'items-start'}`}>
+                      <div className={`p-5 rounded-2xl shadow-sm text-sm leading-relaxed ${
+                        message.role === 'user' 
+                          ? 'bg-emerald-600 text-white rounded-tr-none' 
+                          : 'bg-white text-gray-800 border border-black/5 rounded-tl-none'
+                      }`}>
+                        <div className="prose prose-sm max-w-none prose-emerald">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                              a: ({ node, ...props }) => (
+                                <a 
+                                  {...props} 
+                                  target="_blank" 
+                                  rel="noopener noreferrer" 
+                                  className="text-blue-600 hover:underline font-medium transition-colors"
+                                />
+                              )
+                            }}
+                          >
+                            {message.content}
+                          </ReactMarkdown>
+                        </div>
+                        {message.content === '' && isLoading && (
+                          <div className="flex items-center gap-2 text-emerald-500">
+                            <Loader2 size={18} className="animate-spin" />
+                            <span className="text-xs font-medium">Consultando...</span>
+                          </div>
+                        )}
+                      </div>
+                      <span className="text-[10px] text-gray-400 px-1">
+                        {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </span>
+                    </div>
+                  </div>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+            <div ref={messagesEndRef} />
+          </div>
+        </main>
+
+        {/* Input Area */}
+        <footer className="bg-white border-t border-black/5 p-6 z-10">
+          <div className="max-w-3xl mx-auto">
+            {error && (
+              <motion.div 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="mb-4 p-3 bg-red-50 border border-red-100 text-red-600 rounded-xl text-xs flex items-center gap-2"
+              >
+                <AlertCircle size={14} />
+                {error}
+              </motion.div>
+            )}
+
+            <form onSubmit={handleSubmit} className="relative flex items-center gap-3">
+              <div className="relative flex-1">
+                <input
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  placeholder="Pergunte sobre documentos ou ocupação..."
+                  className="w-full bg-[#f8f9fa] border border-black/5 rounded-2xl py-4 px-6 text-sm focus:outline-none focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-500 transition-all shadow-inner"
+                  disabled={isLoading}
+                />
+              </div>
+              
+              <button
+                type="submit"
+                disabled={!input.trim() || isLoading}
+                className={`p-4 rounded-2xl shadow-lg transition-all flex items-center justify-center ${
+                  !input.trim() || isLoading
+                    ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                    : 'bg-emerald-600 text-white hover:bg-emerald-700 active:scale-95'
+                }`}
+              >
+                {isLoading ? <Loader2 size={20} className="animate-spin" /> : <Send size={20} />}
+              </button>
+            </form>
+            <p className="text-[10px] text-center text-gray-400 mt-4 uppercase tracking-widest font-medium">
+              Grounded + Real-Time UA Libraries
+            </p>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}

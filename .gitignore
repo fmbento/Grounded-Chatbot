@@ -7,3 +7,4 @@ coverage/
 .env*
 !.env.example
 KB/*
+!KB/MD_TXT_PDF_files_go_in_here.txt

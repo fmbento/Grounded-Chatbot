@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    container_name: grounded-knowledge-chatbot-app
+    restart: always
+    env_file:
+      - .env
+    ports:
+      # Mapeia a porta 3003 do host para a 3000 do container
+      - "3003:3000"
+    volumes:
+      # Mapeamento do host para a pasta de dados do container
+      # - /home/ubuntu/dockers/GitHub/Grounded-Knowledge-Chatbot/data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    platform: linux/arm64
